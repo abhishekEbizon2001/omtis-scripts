@@ -188,9 +188,21 @@ const inventoryItemSchema = new mongoose.Schema({
   },
   
   // Raw data for debugging
-  rawData: {
-    type: String,
-    default: ""
+  // rawData: {
+  //   type: String,
+  //   default: ""
+  // },
+  
+  // Movement Information
+  last_movement_date: {
+    type: Date,
+    default: null,
+    index: true
+  },
+  moved_last_12_months: {
+    type: Boolean,
+    default: false,
+    index: true
   },
   
   // Metadata

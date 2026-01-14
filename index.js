@@ -1,8 +1,10 @@
 import express from "express";
 import dotenv from "dotenv";
 import { connectDB } from "./config/db.js";
-import { syncInventory, testAuthentication } from "./scripts/syncInventory.js";
+import { syncInventory, syncAllInventory, syncInventoryFromSalesOrders, testAuthentication } from "./scripts/syncInventory.js";
 import { syncSalesOrders } from "./scripts/syncSalesOrders.js";
+import { netsuiteRequest } from "./utils/netsuiteRequest.js";
+import { generateOAuthHeaders, netsuiteConfig } from "./config/netsuite.js";
 
 // Load environment variables
 dotenv.config();
@@ -76,6 +78,40 @@ app.post("/api/sync", async (req, res) => {
     }
   } catch (error) {
     console.error("Sync endpoint error:", error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Sync ALL inventory items endpoint (no limit)
+app.post("/api/sync/all", async (req, res) => {
+  try {
+    const { batchSize, maxItems, batchDelay } = req.body;
+    
+    console.log(`\n🔄 Full inventory sync triggered (ALL ITEMS)`);
+    console.log("⚠️  This will sync all inventory items from NetSuite - may take a long time...");
+    
+    if (batchSize || maxItems || batchDelay) {
+      console.log(`📦 Batching options: batchSize=${batchSize || 1000}, maxItems=${maxItems || 'unlimited'}, batchDelay=${batchDelay || 200}ms`);
+    }
+    
+    // Run full sync with batching options
+    const result = await syncAllInventory({
+      batchSize: batchSize || 1000,
+      maxItems: maxItems || null,
+      batchDelay: batchDelay || 200
+    });
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(500).json(result);
+    }
+  } catch (error) {
+    console.error("Full sync endpoint error:", error);
     res.status(500).json({ 
       success: false,
       error: error.message,
@@ -229,6 +265,28 @@ app.post("/api/sync/sales-orders", async (req, res) => {
   }
 });
 
+// Sync inventory items from sales orders endpoint
+app.post("/api/sync/inventory-from-sales-orders", async (req, res) => {
+  try {
+    console.log(`\n🔄 Syncing inventory items from sales orders...`);
+    
+    const result = await syncInventoryFromSalesOrders();
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(500).json(result);
+    }
+  } catch (error) {
+    console.error("Sync inventory from sales orders error:", error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
 // Get sales orders
 app.get("/api/sales-orders", async (req, res) => {
   try {
@@ -365,6 +423,370 @@ app.get("/api/sales-orders/stats", async (req, res) => {
     res.status(500).json({ 
       success: false,
       error: error.message
+    });
+  }
+});
+
+// Query item movement data from NetSuite SuiteQL
+app.post("/api/inventory/movement", async (req, res) => {
+  try {
+    let { itemIds, limit } = req.body;
+    let ids = [];
+    
+    // If itemIds are provided, use them
+    if (itemIds && Array.isArray(itemIds) && itemIds.length > 0) {
+      // Validate that all IDs are numbers
+      const invalidIds = itemIds.filter(id => isNaN(parseInt(id)));
+      if (invalidIds.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: "All item IDs must be valid numbers",
+          invalidIds,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+      // Convert all IDs to integers
+      ids = itemIds.map(id => parseInt(id));
+    } else {
+      // Fetch item IDs from NetSuite inventoryItem endpoint
+      console.log("📦 Fetching item IDs from NetSuite inventoryItem endpoint...");
+      
+      const fetchLimit = limit || 100;
+      const inventoryUrl = `${netsuiteConfig.baseUrl}/inventoryItem?limit=${fetchLimit}`;
+      
+      try {
+        const inventoryResponse = await netsuiteRequest({
+          method: "GET",
+          url: inventoryUrl,
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+          },
+          timeout: 30000
+        });
+        
+        // Extract IDs from the response
+        const items = inventoryResponse.data?.items || [];
+        ids = items.map(item => {
+          // Try to get ID from different possible fields
+          return parseInt(item.id || item.internalId || item.itemId);
+        }).filter(id => !isNaN(id));
+        
+        console.log(`✅ Fetched ${ids.length} item IDs from NetSuite`);
+        
+        if (ids.length === 0) {
+          return res.status(404).json({
+            success: false,
+            error: "No item IDs found in NetSuite inventory",
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (fetchError) {
+        console.error("Error fetching item IDs from NetSuite:", fetchError);
+        return res.status(500).json({
+          success: false,
+          error: "Failed to fetch item IDs from NetSuite",
+          details: fetchError.message,
+          timestamp: new Date().toISOString()
+        });
+      }
+    }
+    
+    // Build the SQL query with item IDs
+    const idsString = ids.join(', ');
+    const sqlQuery = `SELECT i.id AS item_id, 1 AS moved_last_12_months, MAX(t.trandate) AS last_movement_date FROM item i LEFT JOIN transactionLine tl ON tl.item = i.id LEFT JOIN transaction t ON t.id = tl.transaction AND t.type = 'ItemShip' AND tl.mainline = 'F' WHERE i.id IN (${idsString}) GROUP BY i.id HAVING MAX(t.trandate) >= ADD_MONTHS(TRUNC(SYSDATE), -12)`;
+    
+    // SuiteQL API endpoint
+    const suiteqlUrl = netsuiteConfig.baseUrl.replace('/record/v1', '/query/v1/suiteql');
+    
+    // Prepare request
+    const requestBody = {
+      q: sqlQuery
+    };
+    
+    console.log(`📊 Querying movement data for ${ids.length} items...`);
+    console.log(`🔍 Item IDs: ${idsString}`);
+    
+    // Make request to SuiteQL API
+    // Note: netsuiteRequest automatically adds Authorization header
+    const response = await netsuiteRequest({
+      method: "POST",
+      url: suiteqlUrl,
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Prefer": "transient"  // Required header for SuiteQL API
+      },
+      data: requestBody,
+      timeout: 60000
+    });
+    
+    // Return the results
+    res.json({
+      success: true,
+      // itemIds: ids,
+      itemIdsCount: ids.length,
+      fetchedFromNetSuite: !req.body.itemIds,
+      query: sqlQuery,
+      results: response.data?.items || response.data || [],
+      count: response.data?.items?.length || 0,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error("Error querying item movement:", error);
+    
+    // Provide more detailed error information
+    const errorResponse = {
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    };
+    
+    if (error.response) {
+      errorResponse.status = error.response.status;
+      errorResponse.statusText = error.response.statusText;
+      errorResponse.data = error.response.data;
+    }
+    
+    res.status(error.response?.status || 500).json(errorResponse);
+  }
+});
+
+// Helper function to fetch movement data for a batch of item IDs
+async function fetchMovementDataForItems(itemIds) {
+  try {
+    if (!itemIds || itemIds.length === 0) {
+      return [];
+    }
+    
+    // Build the SQL query with item IDs - returns all items with their movement status
+    // Items that moved in last 12 months will have moved_last_12_months = 1, others = 0
+    const idsString = itemIds.join(', ');
+    const sqlQuery = `SELECT i.id AS item_id, CASE WHEN MAX(t.trandate) >= ADD_MONTHS(TRUNC(SYSDATE), -12) THEN 1 ELSE 0 END AS moved_last_12_months, MAX(t.trandate) AS last_movement_date FROM item i LEFT JOIN transactionLine tl ON tl.item = i.id LEFT JOIN transaction t ON t.id = tl.transaction AND t.type = 'ItemShip' AND tl.mainline = 'F' WHERE i.id IN (${idsString}) GROUP BY i.id`;
+    
+    // SuiteQL API endpoint
+    const suiteqlUrl = netsuiteConfig.baseUrl.replace('/record/v1', '/query/v1/suiteql');
+    
+    // Prepare request
+    const requestBody = {
+      q: sqlQuery
+    };
+    
+    // Make request to SuiteQL API
+    const response = await netsuiteRequest({
+      method: "POST",
+      url: suiteqlUrl,
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Prefer": "transient"
+      },
+      data: requestBody,
+      timeout: 60000
+    });
+    
+    return response.data?.items || response.data || [];
+  } catch (error) {
+    console.error("Error fetching movement data:", error.message);
+    throw error;
+  }
+}
+
+// Helper function to parse date from NetSuite format (DD/MM/YYYY)
+function parseNetSuiteDate(dateString) {
+  if (!dateString) return null;
+  
+  try {
+    // NetSuite returns dates in DD/MM/YYYY format
+    const parts = dateString.split('/');
+    if (parts.length === 3) {
+      const day = parseInt(parts[0], 10);
+      const month = parseInt(parts[1], 10) - 1; // Month is 0-indexed
+      const year = parseInt(parts[2], 10);
+      return new Date(year, month, day);
+    }
+  } catch (error) {
+    console.error(`Error parsing date ${dateString}:`, error.message);
+  }
+  
+  return null;
+}
+
+// Update inventory items with movement data (batched)
+app.post("/api/inventory/update-movement", async (req, res) => {
+  try {
+    const { batchSize = 100, maxItems = null } = req.body;
+    
+    console.log("🔄 Starting movement data update for inventory items...");
+    console.log(`📦 Batch size: ${batchSize}, Max items: ${maxItems || 'unlimited'}`);
+    
+    const InventoryItem = (await import("./models/InventoryItem.js")).default;
+    
+    // Get total count of items
+    const totalCount = await InventoryItem.countDocuments();
+    console.log(`📊 Total items in database: ${totalCount}`);
+    
+    if (totalCount === 0) {
+      return res.json({
+        success: true,
+        message: "No items found in database",
+        processed: 0,
+        updated: 0,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    let processedCount = 0;
+    let updatedCount = 0;
+    let errorCount = 0;
+    const errors = [];
+    let offset = 0;
+    const limit = maxItems ? Math.min(batchSize, maxItems) : batchSize;
+    let hasMore = true;
+    
+    while (hasMore) {
+      try {
+        // Check if we've reached max items
+        if (maxItems && processedCount >= maxItems) {
+          break;
+        }
+        
+        // Fetch a batch of items from MongoDB
+        const itemsToProcess = maxItems 
+          ? Math.min(limit, maxItems - processedCount)
+          : limit;
+        
+        const items = await InventoryItem.find()
+          .select('internalId')
+          .skip(offset)
+          .limit(itemsToProcess)
+          .lean();
+        
+        if (items.length === 0) {
+          hasMore = false;
+          break;
+        }
+        
+        // Extract internalIds
+        const itemIds = items.map(item => item.internalId).filter(id => id != null);
+        
+        if (itemIds.length === 0) {
+          offset += itemsToProcess;
+          processedCount += items.length;
+          continue;
+        }
+        
+        console.log(`\n📦 Processing batch: ${processedCount + 1} to ${processedCount + items.length} (${itemIds.length} items with IDs)`);
+        
+        // Fetch movement data for this batch
+        const movementData = await fetchMovementDataForItems(itemIds);
+        
+        // Create a map of item_id to movement data for quick lookup
+        const movementMap = new Map();
+        movementData.forEach(item => {
+          const itemId = parseInt(item.item_id);
+          if (!isNaN(itemId)) {
+            const moved = item.moved_last_12_months === "1" || item.moved_last_12_months === 1 || item.moved_last_12_months === true;
+            const lastMovementDate = item.last_movement_date 
+              ? parseNetSuiteDate(item.last_movement_date)
+              : null;
+            
+            movementMap.set(itemId, {
+              last_movement_date: moved ? lastMovementDate : null,
+              moved_last_12_months: moved
+            });
+          }
+        });
+        
+        // Update items in batch
+        const updatePromises = itemIds.map(async (itemId) => {
+          try {
+            const movement = movementMap.get(itemId);
+            
+            if (movement) {
+              // Item has movement data - update it
+              await InventoryItem.updateOne(
+                { internalId: itemId },
+                {
+                  $set: {
+                    last_movement_date: movement.last_movement_date,
+                    moved_last_12_months: movement.moved_last_12_months
+                  }
+                }
+              );
+              if (movement.moved_last_12_months) {
+                updatedCount++;
+              }
+            } else {
+              // Item not in movement results - no transactions, set to null/false
+              await InventoryItem.updateOne(
+                { internalId: itemId },
+                {
+                  $set: {
+                    last_movement_date: null,
+                    moved_last_12_months: false
+                  }
+                }
+              );
+            }
+          } catch (updateError) {
+            errorCount++;
+            errors.push({ itemId, error: updateError.message });
+            console.error(`❌ Error updating item ${itemId}:`, updateError.message);
+          }
+        });
+        
+        await Promise.all(updatePromises);
+        
+        processedCount += items.length;
+        offset += items.length;
+        
+        console.log(`✅ Batch complete: Updated ${movementData.length} items with movement data`);
+        
+        // Add delay between batches to avoid rate limiting
+        if (hasMore && items.length === itemsToProcess) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        
+        // Check if we should continue
+        hasMore = items.length === itemsToProcess && (!maxItems || processedCount < maxItems);
+        
+      } catch (batchError) {
+        console.error(`❌ Error processing batch at offset ${offset}:`, batchError.message);
+        errorCount++;
+        errors.push({ batch: offset, error: batchError.message });
+        // Continue with next batch
+        offset += limit;
+        if (offset >= totalCount) {
+          hasMore = false;
+        }
+      }
+    }
+    
+    console.log("\n" + "=".repeat(60));
+    console.log("📦 MOVEMENT DATA UPDATE COMPLETE");
+    console.log("=".repeat(60));
+    console.log(`📊 Processed: ${processedCount} items`);
+    console.log(`✅ Updated with movement data: ${updatedCount} items`);
+    console.log(`❌ Errors: ${errorCount} items`);
+    
+    res.json({
+      success: true,
+      processed: processedCount,
+      updated: updatedCount,
+      errors: errorCount,
+      errorDetails: errors.length > 0 ? errors.slice(0, 50) : undefined,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error("Error updating movement data:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
   }
 });

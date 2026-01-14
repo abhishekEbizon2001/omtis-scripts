@@ -1,8 +1,15 @@
 import axios from "axios";
 import InventoryItem from "../models/InventoryItem.js";
+import SalesOrder from "../models/SalesOrder.js";
 import { netsuiteConfig, generateOAuthHeaders } from "../config/netsuite.js";
 import { connectDB } from "../config/db.js";
 import Bottleneck from "bottleneck";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // =========================
 // NetSuite Rate Limiter
@@ -28,6 +35,38 @@ async function netsuiteRequest(config, retries = 3) {
 
 // Connect to MongoDB
 await connectDB();
+
+// =========================
+// Logging Helper Functions
+// =========================
+const LOGS_DIR = path.join(__dirname, '..', 'logs');
+
+// Ensure logs directory exists
+if (!fs.existsSync(LOGS_DIR)) {
+  fs.mkdirSync(LOGS_DIR, { recursive: true });
+}
+
+// Function to write error log to file
+function writeErrorLog(itemId, error, logFilePath) {
+  try {
+    const timestamp = new Date().toISOString();
+    const logEntry = `[${timestamp}] Item ID: ${itemId} - Error: ${error}\n`;
+    fs.appendFileSync(logFilePath, logEntry, 'utf8');
+  } catch (writeError) {
+    console.error(`Failed to write to log file: ${writeError.message}`);
+  }
+}
+
+// Function to write sync start log
+function writeSyncStartLog(logFilePath, totalItems) {
+  try {
+    const timestamp = new Date().toISOString();
+    const logEntry = `\n${'='.repeat(80)}\n[${timestamp}] SYNC STARTED - Total items to process: ${totalItems}\n${'='.repeat(80)}\n`;
+    fs.appendFileSync(logFilePath, logEntry, 'utf8');
+  } catch (writeError) {
+    console.error(`Failed to write to log file: ${writeError.message}`);
+  }
+}
 
 // Helper function to extract value from NetSuite response
 const extractValue = (data, fieldPath) => {
@@ -104,6 +143,107 @@ async function fetchInventoryItems(date) {
     return [];
   }
 }
+
+// Function to fetch all inventory items with pagination and batching (no date filter)
+async function fetchAllInventoryItems(options = {}) {
+  try {
+    const {
+      batchSize = 1000,        // Items per API request
+      maxItems = null,          // Maximum total items to fetch (null = no limit)
+      batchDelay = 200         // Delay between batches in ms
+    } = options;
+    
+    let allItems = [];
+    let hasMore = true;
+    let offset = 0;
+    const limit = Math.min(batchSize, 1000); // NetSuite max limit is 1000
+    let totalResults = null;
+    let batchNumber = 0;
+    
+    console.log("🔄 Starting pagination to fetch all inventory items...");
+    console.log(`📦 Batch configuration: ${limit} items per batch${maxItems ? `, max ${maxItems} items` : ''}`);
+    
+    while (hasMore) {
+      try {
+        // Check if we've reached the max items limit
+        if (maxItems !== null && allItems.length >= maxItems) {
+          console.log(`⏹️  Reached max items limit (${maxItems}). Stopping fetch.`);
+          allItems = allItems.slice(0, maxItems);
+          break;
+        }
+        
+        batchNumber++;
+        const itemsToFetch = maxItems !== null 
+          ? Math.min(limit, maxItems - allItems.length)
+          : limit;
+        
+        // Build URL with only limit and offset parameters (no date filter)
+        const url = `${netsuiteConfig.baseUrl}/inventoryItem?limit=${itemsToFetch}&offset=${offset}`;
+        
+        const headers = {
+          Authorization: generateOAuthHeaders(url, "GET"),
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        };
+        
+        const response = await netsuiteRequest({
+          method: "GET",
+          url,
+          headers,
+          timeout: 30000
+        });
+        
+        const responseData = response.data || {};
+        const items = responseData.items || [];
+        allItems = allItems.concat(items);
+        
+        // Get totalResults from first response
+        if (totalResults === null && responseData.totalResults !== undefined) {
+          totalResults = responseData.totalResults;
+          console.log(`📊 Total items available in NetSuite: ${totalResults}`);
+        }
+        
+        // Check if there are more items using hasMore from response
+        hasMore = responseData.hasMore === true;
+        
+        // Update offset for next request
+        offset += items.length;
+        
+        // Progress logging
+        if (totalResults !== null) {
+          const progressPercent = ((allItems.length / totalResults) * 100).toFixed(1);
+          console.log(`✅ Batch ${batchNumber}: Fetched ${allItems.length}/${totalResults} items (${progressPercent}%) - Current batch: ${items.length} items`);
+        } else {
+          console.log(`✅ Batch ${batchNumber}: Fetched ${allItems.length} items so far... (Current batch: ${items.length} items)`);
+        }
+        
+        // Add a delay between batches to avoid rate limiting
+        if (hasMore && (maxItems === null || allItems.length < maxItems)) {
+          await new Promise(resolve => setTimeout(resolve, batchDelay));
+        }
+      } catch (error) {
+        console.error(`❌ Error in pagination at offset ${offset} (batch ${batchNumber}):`, error.message);
+        // Continue with next batch instead of stopping completely
+        offset += limit;
+        if (offset > (totalResults || 100000)) {
+          // If we've gone way past expected results, stop
+          hasMore = false;
+        }
+      }
+    }
+    
+    console.log(`🎉 Pagination complete. Total items fetched: ${allItems.length}${totalResults !== null ? ` of ${totalResults}` : ''} in ${batchNumber} batch(es)`);
+    
+    if (totalResults !== null && allItems.length !== totalResults && maxItems === null) {
+      console.warn(`⚠️  Warning: Expected ${totalResults} items but fetched ${allItems.length} items`);
+    }
+    
+    return allItems;
+  } catch (error) {
+    console.error("Error fetching all inventory items:", error.message);
+    return [];
+  }
+}
  
 
 async function fetchInventoryItemDetail(itemId) {
@@ -122,6 +262,23 @@ async function fetchInventoryItemDetail(itemId) {
       headers,
       timeout: 30000
     });
+
+    // Check if item is inactive immediately - skip expensive operations if inactive
+    if (response.data?.isInactive === true) {
+      // Return early with inactive flag, don't fetch price/location data
+      return {
+        ...response.data,
+        isInactive: true,
+        priceData: {
+          price: 0,
+          currency: "HKD",
+          tradePrice: 0,
+          retailPrice: 0
+        },
+        locationsData: [],
+        totalQuantity: 0
+      };
+    }
 
     let priceData = {
       price: 0,
@@ -436,7 +593,7 @@ function transformInventoryData(netSuiteData) {
     lastModifiedDate: lastModifiedDate,
     
     // Raw data for debugging
-    rawData: JSON.stringify(netSuiteData),
+    // rawData: JSON.stringify(netSuiteData),
     lastSynced: new Date()
   };
 }
@@ -696,6 +853,464 @@ async function syncInventory(limit = 10, date = null) {
   }
 }
 
+// Main function to sync ALL inventory items (no limit)
+async function syncAllInventory(options = {}) {
+  // Create log file with timestamp
+  const logFileName = `sync-all-inventory-${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
+  const logFilePath = path.join(LOGS_DIR, logFileName);
+  
+  // Extract batching options
+  const {
+    batchSize = 1000,        // Items per API request
+    maxItems = null,          // Maximum total items to fetch (null = no limit)
+    batchDelay = 200         // Delay between batches in ms
+  } = options;
+  
+  try {
+    console.log("=== Starting Full Inventory Sync (ALL ITEMS) ===");
+    console.log(`📝 Error log file: ${logFilePath}`);
+    console.log("Configuration:");
+    console.log(`- Realm: ${netsuiteConfig.realm}`);
+    console.log(`- Base URL: ${netsuiteConfig.baseUrl}`);
+    console.log(`- Batch Size: ${batchSize} items per batch`);
+    console.log(`- Max Items: ${maxItems || 'No limit'}`);
+    console.log(`- Batch Delay: ${batchDelay}ms`);
+    
+    // Test authentication first
+    const authSuccess = await testAuthentication();
+    if (!authSuccess) {
+      return {
+        success: false,
+        error: "Authentication failed. Please check your OAuth credentials.",
+        timestamp: new Date().toISOString()
+      };
+    }
+    
+    // Step 1: Fetch ALL inventory items with pagination and batching
+    console.log("\n=== Fetching ALL Inventory Items (with pagination and batching) ===");
+    const items = await fetchAllInventoryItems({ batchSize, maxItems, batchDelay });
+    
+    if (items.length === 0) {
+      console.log("No items to sync");
+      return { 
+        success: true, 
+        message: "No items found", 
+        processed: 0, 
+        saved: 0,
+        timestamp: new Date().toISOString()
+      };
+    }
+    
+    // Write sync start log
+    writeSyncStartLog(logFilePath, items.length);
+    
+    // Step 2: Process ALL items
+    let processedCount = 0;
+    let savedCount = 0;
+    let skippedInactiveCount = 0;
+    const errors = [];
+    const savedItems = [];
+    
+    console.log(`\n=== Processing ${items.length} Items (ALL) ===`);
+    
+    for (const item of items) {
+      const itemId = item.id;
+      processedCount++;
+      
+      // Log progress for every item to show it's working
+      console.log(`\n[${processedCount}/${items.length}] Processing item ID: ${itemId}...`);
+      
+      try {
+        // Step 3: Fetch detailed item data (includes price and location)
+        const detailedData = await fetchInventoryItemDetail(itemId);
+        
+        if (detailedData) {
+          // Skip inactive items instantly
+          if (detailedData.isInactive === true) {
+            skippedInactiveCount++;
+            const displayName = detailedData.itemId || `Item ${itemId}`;
+            const shortName = displayName.length > 40 
+              ? displayName.substring(0, 40) + '...' 
+              : displayName;
+            console.log(`  ⏭️  Skipped (inactive): ${shortName}`);
+            continue;
+          }
+          
+          // Step 4: Transform data
+          const transformedData = transformInventoryData(detailedData);
+          
+          // Step 5: Save to MongoDB
+          try {
+            const result = await InventoryItem.findOneAndUpdate(
+              { internalId: transformedData.internalId },
+              transformedData,
+              { 
+                upsert: true, 
+                new: true, 
+                runValidators: true,
+                setDefaultsOnInsert: true 
+              }
+            );
+            
+            savedCount++;
+            savedItems.push(transformedData);
+            
+            const displayName = transformedData.itemName || `Item ${itemId}`;
+            const shortName = displayName.length > 40 
+              ? displayName.substring(0, 40) + '...' 
+              : displayName;
+            console.log(`  ✅ Saved: ${shortName}`);
+            
+            if (transformedData.averageCost > 0) {
+              console.log(`     📊 Average Cost: ${transformedData.averageCost.toFixed(2)}`);
+            }
+            
+            if (transformedData.totalValue > 0) {
+              console.log(`     💰 Total Value: ${transformedData.totalValue.toFixed(2)}`);
+            }
+            
+          } catch (dbError) {
+            console.error(`  ❌ Error saving item ${itemId}:`, dbError.message);
+            errors.push({ itemId, error: dbError.message });
+          }
+        } else {
+          // Item completely failed to fetch - log to file
+          const errorMsg = "Failed to fetch details";
+          console.error(`  ❌ Failed to fetch details for item ${itemId}`);
+          errors.push({ itemId, error: errorMsg });
+          writeErrorLog(itemId, errorMsg, logFilePath);
+        }
+      } catch (error) {
+        // Item failed during processing - log to file
+        console.error(`  ❌ Error processing item ${itemId}:`, error.message);
+        errors.push({ itemId, error: error.message });
+        writeErrorLog(itemId, error.message, logFilePath);
+      }
+      
+      // Progress update every 25 items
+      if (processedCount % 25 === 0) {
+        const progressPercent = ((processedCount / items.length) * 100).toFixed(1);
+        console.log(`\n📊 Progress Update: ${processedCount}/${items.length} (${progressPercent}%) - Saved: ${savedCount}, Skipped (inactive): ${skippedInactiveCount}, Errors: ${errors.length}`);
+      }
+    }
+    
+    console.log("\n" + "=".repeat(60));
+    console.log("📦 FULL SYNC COMPLETE");
+    console.log("=".repeat(60));
+    console.log(`📊 Total items fetched: ${items.length}`);
+    console.log(`🔄 Processed: ${processedCount} items`);
+    console.log(`✅ Saved: ${savedCount} items`);
+    console.log(`⏭️  Skipped (inactive): ${skippedInactiveCount} items`);
+    console.log(`❌ Failed: ${errors.length} items`);
+    
+    // Log financial summary
+    if (savedItems.length > 0) {
+      logFinancialSummary(savedItems);
+    }
+    
+    if (errors.length > 0) {
+      console.log("\n⚠️  Errors encountered:");
+      // Show first 10 errors
+      const errorsToShow = errors.slice(0, 10);
+      errorsToShow.forEach(err => console.log(`   - Item ${err.itemId}: ${err.error}`));
+      if (errors.length > 10) {
+        console.log(`   ... and ${errors.length - 10} more errors`);
+      }
+      console.log(`\n📝 All fetch errors have been logged to: ${logFilePath}`);
+    }
+    
+    // Write sync completion summary to log file
+    try {
+      const timestamp = new Date().toISOString();
+      const summaryEntry = `\n${'='.repeat(80)}\n[${timestamp}] SYNC COMPLETED\nTotal items: ${items.length}\nProcessed: ${processedCount}\nSaved: ${savedCount}\nSkipped (inactive): ${skippedInactiveCount}\nFailed: ${errors.length}\n${'='.repeat(80)}\n`;
+      fs.appendFileSync(logFilePath, summaryEntry, 'utf8');
+    } catch (writeError) {
+      console.error(`Failed to write summary to log file: ${writeError.message}`);
+    }
+    
+    return {
+      success: true,
+      totalFetched: items.length,
+      processed: processedCount,
+      saved: savedCount,
+      skippedInactive: skippedInactiveCount,
+      failed: errors.length,
+      logFile: logFilePath,
+      financialSummary: savedItems.length > 0 ? {
+        totalAverageCost: savedItems.reduce((sum, item) => sum + (item.averageCost || 0), 0),
+        totalValue: savedItems.reduce((sum, item) => sum + (item.totalValue || 0), 0),
+        itemsWithCost: savedItems.filter(item => item.averageCost > 0).length,
+        itemsWithValue: savedItems.filter(item => item.totalValue > 0).length,
+        averageCostPerItem: savedItems.filter(item => item.averageCost > 0).length > 0 
+          ? savedItems.reduce((sum, item) => sum + (item.averageCost || 0), 0) / 
+            savedItems.filter(item => item.averageCost > 0).length
+          : 0,
+        averageValuePerItem: savedItems.filter(item => item.totalValue > 0).length > 0
+          ? savedItems.reduce((sum, item) => sum + (item.totalValue || 0), 0) / 
+            savedItems.filter(item => item.totalValue > 0).length
+          : 0
+      } : null,
+      errors: errors.length > 0 ? errors.slice(0, 50) : undefined,
+      timestamp: new Date().toISOString()
+    };
+    
+  } catch (error) {
+    console.error("\n❌ Error in full sync process:", error.message);
+    console.error(error.stack);
+    
+    // Log the error to file if log file was created
+    try {
+      if (fs.existsSync(logFilePath)) {
+        const timestamp = new Date().toISOString();
+        const errorEntry = `\n${'='.repeat(80)}\n[${timestamp}] SYNC FAILED - Fatal Error\nError: ${error.message}\nStack: ${error.stack}\n${'='.repeat(80)}\n`;
+        fs.appendFileSync(logFilePath, errorEntry, 'utf8');
+      }
+    } catch (writeError) {
+      console.error(`Failed to write error to log file: ${writeError.message}`);
+    }
+    
+    return {
+      success: false,
+      error: error.message,
+      logFile: fs.existsSync(logFilePath) ? logFilePath : undefined,
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+// Function to sync inventory items from sales orders
+async function syncInventoryFromSalesOrders() {
+  try {
+    console.log("=== Starting Inventory Sync from Sales Orders ===");
+    console.log("=".repeat(60));
+    
+    // Test authentication first
+    const authSuccess = await testAuthentication();
+    if (!authSuccess) {
+      return {
+        success: false,
+        error: "Authentication failed. Please check your OAuth credentials.",
+        timestamp: new Date().toISOString()
+      };
+    }
+    
+    // Step 1: Fetch all sales orders
+    console.log("\n📦 Fetching all sales orders from database...");
+    const salesOrders = await SalesOrder.find({}).select('items');
+    
+    if (salesOrders.length === 0) {
+      console.log("⚠️ No sales orders found in database");
+      return {
+        success: true,
+        message: "No sales orders found",
+        processed: 0,
+        saved: 0,
+        skipped: 0,
+        timestamp: new Date().toISOString()
+      };
+    }
+    
+    console.log(`✅ Found ${salesOrders.length} sales orders`);
+    
+    // Step 2: Extract all unique itemIds from sales orders
+    const itemIdSet = new Set();
+    salesOrders.forEach(order => {
+      if (order.items && Array.isArray(order.items)) {
+        order.items.forEach(item => {
+          if (item.itemId && item.itemId.trim() !== '') {
+            itemIdSet.add(item.itemId.toString());
+          }
+        });
+      }
+    });
+    
+    const uniqueItemIds = Array.from(itemIdSet);
+    console.log(`\n📋 Found ${uniqueItemIds.length} unique item IDs in sales orders`);
+    
+    if (uniqueItemIds.length === 0) {
+      return {
+        success: true,
+        message: "No item IDs found in sales orders",
+        processed: 0,
+        saved: 0,
+        skipped: 0,
+        timestamp: new Date().toISOString()
+      };
+    }
+    
+    // Step 3: Check which items already exist in InventoryItem collection
+    console.log("\n🔍 Checking which items already exist in inventory...");
+    const existingItems = await InventoryItem.find({
+      internalId: { $in: uniqueItemIds.map(id => parseInt(id)) }
+    }).select('internalId');
+    
+    const existingItemIds = new Set(
+      existingItems.map(item => item.internalId.toString())
+    );
+    
+    // Filter out items that already exist
+    const itemsToSync = uniqueItemIds.filter(itemId => 
+      !existingItemIds.has(itemId.toString())
+    );
+    
+    const skippedCount = uniqueItemIds.length - itemsToSync.length;
+    
+    console.log(`✅ Found ${existingItems.length} existing items`);
+    console.log(`⏭️  Skipping ${skippedCount} items that already exist`);
+    console.log(`🔄 Will sync ${itemsToSync.length} new items`);
+    
+    if (itemsToSync.length === 0) {
+      return {
+        success: true,
+        message: "All items from sales orders already exist in inventory",
+        processed: 0,
+        saved: 0,
+        skipped: skippedCount,
+        totalItems: uniqueItemIds.length,
+        timestamp: new Date().toISOString()
+      };
+    }
+    
+    // Step 4: Fetch and save new items
+    let processedCount = 0;
+    let savedCount = 0;
+    let skippedInactiveCount = 0;
+    const errors = [];
+    const savedItems = [];
+    
+    console.log(`\n=== Processing ${itemsToSync.length} New Items ===`);
+    
+    for (const itemId of itemsToSync) {
+      processedCount++;
+      console.log(`\n[${processedCount}/${itemsToSync.length}] Processing item ID: ${itemId}`);
+      
+      try {
+        // Fetch detailed item data from NetSuite
+        const detailedData = await fetchInventoryItemDetail(itemId);
+        
+        if (detailedData) {
+          // Check if item is inactive - only save items where isInactive is false
+          if (detailedData.isInactive !== false) {
+            skippedInactiveCount++;
+            const displayName = detailedData.itemId || `Item ${itemId}`;
+            const shortName = displayName.length > 40 
+              ? displayName.substring(0, 40) + '...' 
+              : displayName;
+            const reason = detailedData.isInactive === true ? 'inactive' : 'isInactive field not false';
+            console.log(`⏭️  Skipped (${reason}): ${shortName}`);
+            await new Promise(resolve => setTimeout(resolve, 200));
+            continue;
+          }
+          
+          // Transform data
+          const transformedData = transformInventoryData(detailedData);
+          
+          // Save to MongoDB
+          try {
+            const result = await InventoryItem.findOneAndUpdate(
+              { internalId: transformedData.internalId },
+              transformedData,
+              { 
+                upsert: true, 
+                new: true, 
+                runValidators: true,
+                setDefaultsOnInsert: true 
+              }
+            );
+            
+            savedCount++;
+            savedItems.push(transformedData);
+            
+            // Log item info
+            const displayName = transformedData.itemName || `Item ${itemId}`;
+            const shortName = displayName.length > 40 
+              ? displayName.substring(0, 40) + '...' 
+              : displayName;
+            
+            console.log(`✅ Saved: ${shortName}`);
+            
+            if (transformedData.averageCost > 0) {
+              console.log(`   📊 Average Cost: ${transformedData.averageCost.toFixed(2)}`);
+            }
+            
+            if (transformedData.totalValue > 0) {
+              console.log(`   💰 Total Value: ${transformedData.totalValue.toFixed(2)}`);
+            }
+            
+          } catch (dbError) {
+            console.error(`❌ Error saving item ${itemId}:`, dbError.message);
+            errors.push({ itemId, error: dbError.message });
+          }
+        } else {
+          console.error(`❌ Failed to fetch details for item ${itemId}`);
+          errors.push({ itemId, error: "Failed to fetch details" });
+        }
+      } catch (error) {
+        console.error(`❌ Error processing item ${itemId}:`, error.message);
+        errors.push({ itemId, error: error.message });
+      }
+      
+      // Add a small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    console.log("\n" + "=".repeat(60));
+    console.log("📦 SYNC COMPLETE");
+    console.log("=".repeat(60));
+    console.log(`📊 Total unique items in sales orders: ${uniqueItemIds.length}`);
+    console.log(`⏭️  Skipped (already exist): ${skippedCount}`);
+    console.log(`🔄 Processed: ${processedCount} items`);
+    console.log(`✅ Saved: ${savedCount} items`);
+    console.log(`⏭️  Skipped (inactive): ${skippedInactiveCount} items`);
+    console.log(`❌ Failed: ${errors.length} items`);
+    
+    // Log financial summary if items were saved
+    if (savedItems.length > 0) {
+      logFinancialSummary(savedItems);
+    }
+    
+    if (errors.length > 0) {
+      console.log("\n⚠️  Errors encountered:");
+      errors.forEach(err => console.log(`   - Item ${err.itemId}: ${err.error}`));
+    }
+    
+    return {
+      success: true,
+      totalItems: uniqueItemIds.length,
+      skipped: skippedCount,
+      skippedInactive: skippedInactiveCount,
+      processed: processedCount,
+      saved: savedCount,
+      failed: errors.length,
+      financialSummary: savedItems.length > 0 ? {
+        totalAverageCost: savedItems.reduce((sum, item) => sum + (item.averageCost || 0), 0),
+        totalValue: savedItems.reduce((sum, item) => sum + (item.totalValue || 0), 0),
+        itemsWithCost: savedItems.filter(item => item.averageCost > 0).length,
+        itemsWithValue: savedItems.filter(item => item.totalValue > 0).length,
+        averageCostPerItem: savedItems.filter(item => item.averageCost > 0).length > 0 
+          ? savedItems.reduce((sum, item) => sum + (item.averageCost || 0), 0) / 
+            savedItems.filter(item => item.averageCost > 0).length
+          : 0,
+        averageValuePerItem: savedItems.filter(item => item.totalValue > 0).length > 0
+          ? savedItems.reduce((sum, item) => sum + (item.totalValue || 0), 0) / 
+            savedItems.filter(item => item.totalValue > 0).length
+          : 0
+      } : null,
+      errors: errors.length > 0 ? errors : undefined,
+      timestamp: new Date().toISOString()
+    };
+    
+  } catch (error) {
+    console.error("\n❌ Error in sync process:", error.message);
+    console.error(error.stack);
+    return {
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
 // Function to check existing data with financial stats
 async function checkExistingData() {
   try {
@@ -813,4 +1428,4 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
 }
 
 // Export for use in other files
-export { syncInventory, checkExistingData, testAuthentication };
+export { syncInventory, syncAllInventory, syncInventoryFromSalesOrders, checkExistingData, testAuthentication };

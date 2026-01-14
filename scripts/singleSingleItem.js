@@ -400,7 +400,7 @@ function transformInventoryData(netSuiteData, priceData, locationsData = []) {
     lastModifiedDate: lastModifiedDate,
     
     // Raw data for debugging
-    rawData: JSON.stringify(netSuiteData),
+    // rawData: JSON.stringify(netSuiteData),
     lastSynced: new Date()
   };
 }
